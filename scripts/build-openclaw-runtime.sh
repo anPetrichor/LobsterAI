@@ -77,20 +77,30 @@ node -e 'const [a,b,c]=process.versions.node.split(".").map(Number);const ok=a>2
 
 # ---------------------------------------------------------------------------
 # Build cache: skip if the runtime was already built for the pinned version.
+# On Windows (Git Bash / MSYS2), paths like $ELECTRON_ROOT are Unix-style
+# (e.g. /d/github/LobsterAI) which Node.js cannot resolve via require().
+# Use "node -" with process.argv so MSYS2 auto-converts the paths.
 # ---------------------------------------------------------------------------
 DESIRED_VERSION=""
-DESIRED_VERSION=$(node -e "
-  const pkg = require('$ELECTRON_ROOT/package.json');
+DESIRED_VERSION=$(node - "$ELECTRON_ROOT" <<'READVER'
+const path = require('path');
+try {
+  const pkg = require(path.join(process.argv[2], 'package.json'));
   if (pkg.openclaw && pkg.openclaw.version) console.log(pkg.openclaw.version);
-" 2>/dev/null || true)
+} catch {}
+READVER
+)
 
-if [[ -n "$DESIRED_VERSION" && "$OPENCLAW_FORCE_BUILD" != "1" ]]; then
+if [[ -n "$DESIRED_VERSION" && "${OPENCLAW_FORCE_BUILD:-}" != "1" ]]; then
   BUILD_INFO="$OUT_DIR/runtime-build-info.json"
   if [[ -f "$BUILD_INFO" ]]; then
-    BUILT_VERSION=$(node -e "
-      const info = require('$BUILD_INFO');
-      console.log(info.openclawVersion || '');
-    " 2>/dev/null || true)
+    BUILT_VERSION=$(node - "$BUILD_INFO" <<'READBI'
+try {
+  const info = require(process.argv[2]);
+  console.log(info.openclawVersion || '');
+} catch {}
+READBI
+    )
     if [[ "$BUILT_VERSION" == "$DESIRED_VERSION" ]]; then
       echo "[openclaw-runtime] Already built for $DESIRED_VERSION (target=$TARGET_ID), skipping."
       echo "[openclaw-runtime] Use OPENCLAW_FORCE_BUILD=1 to force rebuild."
@@ -266,6 +276,3 @@ popd >/dev/null
 
 echo "[7/7] Done"
 echo "Runtime output: $OUT_DIR"
-if command -v du >/dev/null 2>&1; then
-  du -sh "$OUT_DIR" 2>/dev/null || true
-fi
