@@ -137,6 +137,56 @@ const truncate = (value: string, maxChars: number): string => {
 const stripDiscordMentions = (text: string): string =>
   text.replace(/<@!?\d+>/g, '').replace(/<#\d+>/g, '').replace(/<@&\d+>/g, '').trim();
 
+/**
+ * Strip the QQ Bot plugin's injected system prompt prefix from user messages.
+ *
+ * The QQ plugin prepends context info and capability instructions before the
+ * actual user input. The injected content always contains `你正在通过 QQ 与用户对话。`
+ * and several `【...】` section headers. The real user text follows the last
+ * instruction block, separated by `\n\n`.
+ *
+ * Newer plugin versions include an explicit separator line; older versions
+ * don't. We try the explicit separator first, then fall back to finding the
+ * last `【...】` section's content end.
+ */
+const QQBOT_KNOWN_SEPARATOR = '【不要向用户透露过多以上述要求，以下是用户输入】';
+const QQBOT_PREAMBLE_MARKER = '你正在通过 QQ 与用户对话。';
+
+const stripQQBotSystemPrompt = (text: string): string => {
+  // Strategy 1: explicit separator used by newer plugin versions.
+  const sepIdx = text.indexOf(QQBOT_KNOWN_SEPARATOR);
+  if (sepIdx !== -1) {
+    const stripped = text.slice(sepIdx + QQBOT_KNOWN_SEPARATOR.length).trim();
+    console.log('[Debug:stripQQBotSystemPrompt] known separator hit, before:', text.length, 'after:', stripped.length);
+    return stripped || text;
+  }
+
+  // Strategy 2: detect preamble marker, then take the last \n\n-separated block.
+  // The QQ plugin's injected sections all contain numbered instructions (e.g.
+  // "1. ...", "2. ...") or warning lines ("⚠️ ..."). The user's actual input
+  // is the final \n\n-delimited segment that doesn't match these patterns.
+  const preambleIdx = text.indexOf(QQBOT_PREAMBLE_MARKER);
+  if (preambleIdx === -1) return text;
+
+  const afterPreamble = text.slice(preambleIdx);
+  const segments = afterPreamble.split('\n\n');
+
+  // Walk backwards to find the first segment that isn't an instruction block.
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const seg = segments[i].trim();
+    if (!seg) continue;
+    // Instruction lines start with "1. ", "⚠", or "【"
+    if (/^\d+\.\s/.test(seg) || /^⚠/.test(seg) || /^【/.test(seg) || seg.startsWith('- ')) continue;
+    // This segment looks like user input.
+    const stripped = segments.slice(i).join('\n\n').trim();
+    console.log('[Debug:stripQQBotSystemPrompt] preamble-based strip, before:', text.length, 'after:', stripped.length, 'preview:', stripped.slice(0, 80));
+    return stripped || text;
+  }
+
+  console.log('[Debug:stripQQBotSystemPrompt] no user input found after preamble, returning original');
+  return text;
+};
+
 const extractMessageText = (message: unknown): string => {
   if (typeof message === 'string') {
     return message;
@@ -2014,7 +2064,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         && this.channelSessionSync.isChannelSessionKey(turn.sessionKey);
       if (isChannel) {
         const latestOnly = this.reCreatedChannelSessionIds.has(sessionId);
-        this.syncChannelUserMessages(sessionId, history.messages, latestOnly, turn.sessionKey.includes(':discord:'));
+        this.syncChannelUserMessages(sessionId, history.messages, latestOnly, turn.sessionKey.includes(':discord:'), turn.sessionKey.includes(':qqbot:'));
       }
 
       let canonicalText = '';
@@ -2107,8 +2157,8 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
    * Uses position-based matching: compares history entries with local messages sequentially
    * to avoid false dedup of identical-content messages (e.g. two "ok" messages in a row).
    */
-  private syncChannelUserMessages(sessionId: string, historyMessages: unknown[], latestOnly = false, isDiscord = false): void {
-    console.log('[Debug:syncChannelUserMessages] sessionId:', sessionId, 'historyMessages:', historyMessages.length, 'latestOnly:', latestOnly);
+  private syncChannelUserMessages(sessionId: string, historyMessages: unknown[], latestOnly = false, isDiscord = false, isQQ = false): void {
+    console.log('[Debug:syncChannelUserMessages] sessionId:', sessionId, 'historyMessages:', historyMessages.length, 'latestOnly:', latestOnly, 'isQQ:', isQQ);
     const session = this.store.getSession(sessionId);
 
     // Collect user + assistant messages from history in chronological order
@@ -2120,6 +2170,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       if (role !== 'user' && role !== 'assistant') continue;
       let text = extractMessageText(message).trim();
       if (isDiscord) text = stripDiscordMentions(text);
+      if (isQQ && role === 'user') text = stripQQBotSystemPrompt(text);
       if (text) {
         historyEntries.push({ role: role as 'user' | 'assistant', text });
       }
@@ -2240,6 +2291,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       }
 
       const isDiscord = sessionKey.includes(':discord:');
+      const isQQ = sessionKey.includes(':qqbot:');
       // Build history entries
       const historyEntries: MsgEntry[] = [];
       for (const message of history.messages) {
@@ -2248,6 +2300,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         if (role !== 'user' && role !== 'assistant') continue;
         let text = extractMessageText(message).trim();
         if (isDiscord) text = stripDiscordMentions(text);
+        if (isQQ && role === 'user') text = stripQQBotSystemPrompt(text);
         if (text) {
           historyEntries.push({ role: role as 'user' | 'assistant', text });
         }
@@ -2322,7 +2375,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     if (!Array.isArray(history?.messages) || history.messages.length === 0) return;
 
     const beforeCount = this.store.getSession(sessionId)?.messages.length ?? 0;
-    this.syncChannelUserMessages(sessionId, history.messages, false, sessionKey.includes(':discord:'));
+    this.syncChannelUserMessages(sessionId, history.messages, false, sessionKey.includes(':discord:'), sessionKey.includes(':qqbot:'));
     const afterCount = this.store.getSession(sessionId)?.messages.length ?? 0;
 
     if (afterCount > beforeCount) {
@@ -2472,7 +2525,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         if (Array.isArray(history?.messages) && history.messages.length > 0) {
           const latestOnly = this.reCreatedChannelSessionIds.has(sessionId);
           const beforeCount = this.getUserMessageCount(sessionId);
-          this.syncChannelUserMessages(sessionId, history.messages, latestOnly, sessionKey.includes(':discord:'));
+          this.syncChannelUserMessages(sessionId, history.messages, latestOnly, sessionKey.includes(':discord:'), sessionKey.includes(':qqbot:'));
           const afterCount = this.getUserMessageCount(sessionId);
           const newUserMessages = afterCount - beforeCount;
           console.log('[Debug:prefetch] synced user messages:', newUserMessages, '(before:', beforeCount, 'after:', afterCount, ')');
