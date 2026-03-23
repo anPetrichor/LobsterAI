@@ -899,20 +899,41 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     }
 
     const sessionId = pending.sessionId;
+    const isManualApproval = !pending.allowAlways;
 
     void client.request('exec.approval.resolve', {
       id: requestId,
       decision,
     }).then(() => {
-      // If the agent run already ended while waiting for user approval,
-      // continue the session so the model can see the actual command result.
-      if (!this.isSessionActive(sessionId)) {
-        const prompt = decision !== 'deny'
-          ? t('execApprovalApproved')
-          : t('execApprovalDenied');
+      // Only continue session for manual (desktop modal) approvals.
+      // Auto-approved commands (local safe + IM) resolve fast enough
+      // that the model sees the actual result, not approval-pending.
+      if (!isManualApproval) return;
+
+      const prompt = decision !== 'deny'
+        ? t('execApprovalApproved')
+        : t('execApprovalDenied');
+      const resume = () => {
         void this.continueSession(sessionId, prompt).catch((error) => {
           console.warn('[OpenClawRuntime] Failed to continue session after approval:', error);
         });
+      };
+
+      if (!this.isSessionActive(sessionId)) {
+        resume();
+      } else {
+        // User approved before the model's run ended. Poll until it finishes.
+        const poll = (remaining: number) => {
+          if (remaining <= 0) return;
+          setTimeout(() => {
+            if (!this.isSessionActive(sessionId)) {
+              resume();
+            } else {
+              poll(remaining - 1);
+            }
+          }, 1000);
+        };
+        poll(10);
       }
     }).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
